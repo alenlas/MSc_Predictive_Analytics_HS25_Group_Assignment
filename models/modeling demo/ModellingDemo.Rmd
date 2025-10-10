@@ -1,0 +1,320 @@
+---
+title: "Modelling Demo Caravan Insurance"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+```
+
+This is our project for Predictive Analytics 
+
+```{r  message=FALSE}
+
+library(tidyverse)
+
+# Load caTools package for data partitioning
+library(caTools) 
+
+# Import our data and assing it to churndt
+churndt <- read.csv('/Users/alenslaskovs/Desktop/WHU/PA/GroupWork/MSc_Predictive_Analytics_HS25_Group_Assignment/data/processed/ticdata2000_clean.csv')
+
+# Display the structure of the dataset
+
+head(churndt, 10)
+
+```
+
+Let's start with data preparation.
+
+* Customer ID (id) does not have any effect on the target variable. Remove that feature from the dataset.
+
+```{r  message=FALSE}
+
+# Remove customer ID from the dataset
+
+#churndt <- subset(churndt, select = -id)
+
+```
+
+***
+
+* Display the summary of the dataset. 
+
+```{r  message=FALSE}
+
+# Display the summary
+str(churndt)
+
+```
+
+* Update the data types if necessary.
+
+```{r  message=FALSE}
+
+# Update the data types if necessary
+
+# Categorical factors
+
+---
+
+
+```
+
+***
+
+* Split the dataset into the training (70%) and test (30%) sets by using `sample.split()` function.
+
+```{r  message=FALSE, eval=FALSE}
+
+# Set a seed
+
+set.seed(1234)
+
+# Generate a vector partition for data partitioning 
+partition = sample.split(churndt$CLASS, SplitRatio = 0.7) 
+
+# Create training set: training
+training = subset(churndt, partition == TRUE) 
+
+# Create test set: test
+test = subset(churndt, partition == FALSE) 
+
+```
+
+***
+
+Next, we will learn how to build some of the predictive models. Training data would be used to train and develop our predictive models. Later, we will use test data to predict customer class (1) for churn or (0) for stay. 
+
+
+
+**Decision Tree**
+
+Now, we will build one of the decision tree models known as conditional inference tree in R. The function `ctree()` is used to create conditional trees. The main components of this function are formula (specifying which is the target variable and what  features will be used in modelling) and data. The basic syntax of this function can be given as follows:
+
+    ctree(formula, data)
+
+`ctree()` function is located in package `partykit`. Let's load `partykit` package and start to work on the decision tree model. 
+
+```{r  message=FALSE, eval = FALSE}
+
+# Install party package
+install.packages("partykit")
+
+# Load package party
+library(partykit)
+
+```
+
+* Build a decision tree by using all features. Call this model *decTree*. We will use this model for prediction.
+
+```{r  message=FALSE, eval = FALSE}
+
+# Build a decision tree by using ctree() function
+decTree <- ctree(CLASS ~ ., data = training)
+
+# Print decTree
+
+print(decTree)
+
+```
+
+
+* Build another decision tree by using features HOUSE and AVG_OVERCHARGE. We will use this model just for illustration.
+
+```{r  message=FALSE, eval = FALSE}
+
+# Build a decision tree by using features HOUSE and AVG_OVERCHARGE
+DT <- ctree(CLASS ~ ---, data = training)
+
+# Print DT
+print(DT)
+
+# Plot DT
+plot(DT, type='simple')
+
+```
+
+
+
+* Use the *decTree* model and predict the classes in the test data using `predict()` function. 
+
+  The syntax of `predict()` function is of the form `predict(model, testdata, type = "--")`. The first argument is the model object - technically a list - produced by a modellig functions (such as the object `DecTree` produced above). The input `testdata` denotes the testing dataset to be scored. The function takes one additional argument which is `type`. Type refers to the type of predicted value returned. For `ctree()`, type argument can take one of the following values:
+
+  - response: the predicted class for a categorical response
+  - prob: class probabilities
+  - node: terminal nodes
+
+```{r  message=FALSE, eval = FALSE}
+
+# Predicting the Test set results 
+ decTree_predict = predict(decTree, newdata = test, type = "response")
+
+```
+
+
+Let's find out how many of the predictions are correct. 
+
+ * Copy test data to *results*
+
+```{r message=FALSE, eval = FALSE}
+ # Copy test data to results
+results <- test
+```
+
+* Find the correct predictions.
+
+```{r  message=FALSE, eval = FALSE}
+
+#  Generate a column named PredictionTree in dataframe results and add predictions obtained by decision tree to that column
+results$PredictionTree <- predict(decTree, newdata = results, type = "response" )
+
+# Find the correct predictions
+correct_Tree <- which(results$PredictionTree == results$CLASS)
+
+# Return the total number of correct predictions
+length(correct_Tree)
+
+```
+
+
+
+
+**Linear Discriminant Analysis**
+
+Linear Discriminant analysis (LDA) is a linear classification method. This method finds the linear combination of the attributes that separates the classes of target variable. To build an LDA model, we will use `lda()` function from `MASS` package. The basic syntax of this function can be given as follows:
+
+      lda(formula, data)
+      
+Let's load `MASS` package and build an LDA model by using LEFTOVER, HOUSE, AVG_OVERCHARGE and AVG_CALL features. Call this model *LDAmodel*. 
+
+```{r  message=FALSE, eval = FALSE}
+
+# Load MASS package
+library(MASS)
+
+# Build an LDA model by using lda() function
+LDAmodel <- lda(CLASS ~ ---, data = training)
+
+# Print model
+LDAmodel
+
+```
+
+* Predict the classes in the test data using `predict()` function. The syntax is:
+
+              predict(modelname, test data)
+
+```{r  message=FALSE, eval = FALSE}
+
+# Predict the Test set results 
+ LDA_predict = predict(LDAmodel, newdata = test)$class
+
+```
+
+* By following the same steps as the decision tree model, find the correct predictions.
+
+```{r  message=FALSE, eval = FALSE}
+
+#  Generate a column named PredictionLDA in dataframe results and add predictions obtained by LDA to that column
+results$PredictionLDA <- predict(LDAmodel, newdata = results)$class
+
+# Find the correct predictions
+correct_LDA <- which(results$PredictionLDA == results$CLASS)
+
+# Return the total number of correct predictions
+length(correct_LDA)
+
+```
+
+
+
+
+
+
+
+**Support Vector Machine (SVM)**
+
+The function `svm()` in package `e1071` is used to develop a SVM model. The basic syntax of this function can be given as follows
+
+    svm(formula, data, kernel method, scale=TRUE )
+    
+- Formula shows which features are used in modelling to predict the target variable.
+
+- Data is the dataset that will be used for model building.
+
+- If our data is linearly separable, we use linear separation `kernel = "linear"`. However, if our data is not linearly separable, then we should use other separation techniques (such as `kernel = "radial"`). For other kernel techniques, you can check [R documentation](https://www.rdocumentation.org/packages/e1071/versions/1.7-2/topics/svm). 
+
+- The last argument `scale=TRUE` is related to feature scaling. When one feature 
+has very large values, it will dominate the other features when calculating the distance in SVM. Therefore, we scale them to have equal influence on the SVM metrics.
+
+Let's load `e1071` package and start to work on the SVM model.
+
+```{r  message=FALSE, eval = FALSE}
+
+# Install e1071 package for SVM model
+install.packages("e1071")
+
+# Load package e1071
+library(e1071)
+
+```
+
+***
+
+* Build an SVM model by using all features. Set the `kernel = "radial"`. Call this model *svm_radial*.
+
+```{r  message=FALSE, eval = FALSE}
+
+# Build an SVM model by using svm() function
+svm_radial <- svm(CLASS ~ ., data = training, kernel = "radial", scale = TRUE)
+
+# Print svm_radial
+print(svm_radial)
+
+```
+
+* Using this model, predict customer classification (1 or 0) for the test data. Use `predict()` function for this task. The basic syntax of `predict()` function for SVM takes two arguments: predictive model (in this case svm_radial) and unseen dataset which is our test set. The syntax is:
+
+         predict(modelname, test data)
+
+```{r  message=FALSE, eval=FALSE}
+
+# Predicting the Test set results 
+ svm_predict <- predict(svm_radial, newdata = test)
+
+```
+
+
+Let's find out how many of the predictions are correct. 
+
+ * Copy test data to *results*  
+ * Generate a column in *results* as "PredictionSVM" and add predictions obtained by SVM.
+ 
+```{r  message=FALSE, eval=FALSE}
+
+# Copy test data to results
+results <- test
+
+# The following code generates a column named PredictionSVM in dataframe results and adds predictions obtained by SVM to that column
+results$PredictionSVM <- predict(svm_radial, newdata = results)
+
+```
+ 
+ * Find the correct predictions by comparing "CLASS" and "PredictionSVM" columns.
+
+```{r  message=FALSE, eval = FALSE}
+
+# Find the correct predictions
+correct_svm <- which(results$PredictionSVM == results$CLASS)
+
+# Return the total number of correct predictions by using length() function
+length(correct_svm)
+
+```
+
+
+
+
+
+
