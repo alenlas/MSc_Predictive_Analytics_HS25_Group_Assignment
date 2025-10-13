@@ -3,31 +3,130 @@ title: "Modelling Demo Caravan Insurance"
 output: html_document
 ---
 
-if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
-if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
-if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
-if (!requireNamespace("skimr", quietly = TRUE)) install.packages("skimr")
-if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
-if (!requireNamespace("readr", quietly = TRUE)) install.packages("readr")
+This is our project for Predictive Analytics 
 
-#from the meeting notes
+# Project Overview
 
-marketing_cost   <- 0.89
-marketing_budget <- 50000
-revenue_per_client <- 600
-profit_margin <- 0.05
-total_market_size <- 500000
-const_seed       <- 42
+Following our initial meeting, we aligned on a business goal of **profitable growth** in the Caravan segment. The campaign will use personalized letters to existing customers and we will leverage predictive modeling to prioritize whom to contact.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Business Inputs (from interview)
+
+- **Budget (B):** €50,000  
+- **Cost per contact (c):** €0.89 (letter)  
+- **Revenue per new Caravan policy (R):** €600 p.a.  
+- **Profit margin (m):** 5%  
+- **Total addressable base:** 500,000 customers  
+- **Random seed (reproducibility):** 42
+
+## Derived KPIs (used throughout)
+
+We’ll compute:
+- **Profit per conversion:** \( p = R \times m \)  
+- **Max contacts under budget:** \( N_{\text{budget}} = \left\lfloor \dfrac{B}{c} \right\rfloor \)  
+- **Breakeven precision:** \( \text{Precision}_{\text{min}} = \dfrac{c}{p} \)  
+  (minimum positive rate among contacted customers needed to avoid losses)
+
+These KPIs translate model scores into actionable, **budget-constrained** outreach plans.
+
+## Modeling Objective
+
+Build a propensity model that ranks customers by likelihood to buy **Caravan**. We’ll compare operating strategies:
+
+1. **Top-N (Budget-Constrained):** Contact the top \(N_{\text{budget}}\) customers by predicted probability.  
+2. **Profit-Optimal Threshold:** Choose a probability cutoff that maximizes expected profit.
+
+For both, we will report **Precision, Recall, Lift, AUC/PR-AUC, Profit, ROI**, and recommend the plan that best aligns with “**maximize growth while staying profitable**.”
+
+## Data & Method (high level)
+
+- **Dataset:** ticdata2000 (cleaned snapshot).  
+- **Split:** 70% **training** / 30% **test** (seed = 42).  
+- **Features:** Household-level predictors prioritized; highly correlated postcode prevalence variables dropped to reduce redundancy.  
+- **Models:** Logistic Regression (baseline), Conditional Inference Tree (interpretable).  
+- **Evaluation:** ROC/AUC, PR-AUC (for class imbalance), calibration (HL test + decile plot), and **business KPIs** under Top-N and profit-optimal threshold.
+
+## Decision & Deployment
+
+- Select the operating plan with **higher profit** (and acceptable precision).  
+- **Pilot** (A/B) on a small slice (e.g., 2 weeks), verify conversion uplift and realized profit, then scale.
+
+---
+
+### Business inputs (code)
+```{r}
+marketing_cost       <- 0.89
+marketing_budget     <- 50000
+revenue_per_client   <- 600
+profit_margin        <- 0.05
+total_market_size    <- 500000
+const_seed           <- 42
+
+# Derived KPIs
+profit_per_win <- revenue_per_client * profit_margin            # € per true positive
+n_budget       <- floor(marketing_budget / marketing_cost)       # max letters
+breakeven_prec <- marketing_cost / profit_per_win                # min precision to break even
+
+cat(sprintf("Profit per policy: €%.2f | Max contacts: %d | Breakeven precision: %.3f\n",
+            profit_per_win, n_budget, breakeven_prec))
+```
+
+### Business KPIs after scoring (place this **after** you create `p_lr` and `test`)
+```{r}
+# Requires: p_lr (probabilities on test), test$CARAVAN defined earlier
+
+y <- as.integer(test$CARAVAN == "1")
+
+metrics_at <- function(pred_idx) {
+  TP <- sum(y[pred_idx] == 1); FP <- length(pred_idx) - TP
+  spend    <- (TP + FP) * marketing_cost
+  profit   <- TP * profit_per_win - spend
+  precision <- ifelse(TP+FP == 0, NA, TP/(TP+FP))
+  recall    <- TP / sum(y)
+  roi       <- ifelse(spend == 0, NA, profit / spend)
+  c(N=length(pred_idx), TP=TP, FP=FP, Precision=precision, Recall=recall,
+    Profit=profit, ROI=roi, Spend=spend)
+}
+
+# Plan A: Top-N (budget)
+ord  <- order(p_lr, decreasing = TRUE)
+pick <- ord[seq_len(min(n_budget, length(ord)))]
+res_topN <- metrics_at(pick)
+cat("\nTop-N (budget) results:\n"); print(round(res_topN, 3))
+
+# Plan B: Profit-optimal threshold scan
+grid <- seq(0.01, 0.50, by = 0.005)
+scan_res <- sapply(grid, function(th) {
+  pred_idx <- which(p_lr >= th)
+  metrics_at(pred_idx)["Profit"]
+})
+best_th <- grid[which.max(scan_res)]
+pred_idx_best <- which(p_lr >= best_th)
+res_best <- metrics_at(pred_idx_best)
+
+cat(sprintf("\nProfit-opt threshold: th = %.3f\n", best_th))
+print(round(res_best, 3))
+
+# Compact comparison
+comp <- rbind(TopN = res_topN, ProfitOpt = res_best)
+as.data.frame(t(round(comp, 3)))
+```
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
 ```
 
-This is our project for Predictive Analytics 
 
 ```{r  message=FALSE}
 
 library(tidyverse)
+
+
 
 # Load caTools package for data partitioning
 library(caTools) 
@@ -53,27 +152,12 @@ Let's start with data preparation.
 
 ```
 
-***
-
 * Display the summary of the dataset. 
 
 ```{r  message=FALSE}
 
 # Display the summary
 str(churndt)
-
-```
-
-* Update the data types if necessary.
-
-```{r  message=FALSE}
-
-# Update the data types if necessary
-
-# Categorical factors
-
----
-
 
 ```
 
@@ -85,7 +169,8 @@ str(churndt)
 
 # Set a seed
 
-set.seed(1234)
+const_seed <- 1234
+set.seed(const_seed)
 
 # Generate a vector partition for data partitioning 
 partition = sample.split(churndt$CARAVAN, SplitRatio = 0.7) 
@@ -379,25 +464,13 @@ acc  <- mean(pred == test$CARAVAN)
 cat(sprintf("\nTest accuracy: %.3f\n", acc))
 
 # Optional: simple plot
-# plot(decTree, type = "simple")
+plot(decTree, type = "simple")
 
 ```
 
 
 * Build another decision tree by using features HOUSE and AVG_OVERCHARGE. We will use this model just for illustration.
 
-```{r  message=FALSE, eval = FALSE}
-
-# Build a decision tree by using features HOUSE and AVG_OVERCHARGE
-DT <- ctree(CLASS ~ ---, data = training_set)
-
-# Print DT
-print(DT)
-
-# Plot DT
-plot(DT, type='simple')
-
-```
 
 
 
@@ -412,7 +485,8 @@ plot(DT, type='simple')
 ```{r  message=FALSE, eval = FALSE}
 
 # Predicting the Test set results 
- decTree_predict = predict(decTree, newdata = test, type = "response")
+ decTree_predict = predict(decTree, test, type = "response")
+
 
 ```
 
@@ -431,10 +505,10 @@ results <- test
 ```{r  message=FALSE, eval = FALSE}
 
 #  Generate a column named PredictionTree in dataframe results and add predictions obtained by decision tree to that column
-results$PredictionTree <- predict(decTree, newdata = results, type = "response" )
+results$PredictionTree <- decTree_predict
 
 # Find the correct predictions
-correct_Tree <- which(results$PredictionTree == results$CLASS)
+correct_Tree <- which(results$PredictionTree == results$CARAVAN)
 
 # Return the total number of correct predictions
 length(correct_Tree)
@@ -576,7 +650,6 @@ correct_svm <- which(results$PredictionSVM == results$CLASS)
 length(correct_svm)
 
 ```
-
 
 
 
