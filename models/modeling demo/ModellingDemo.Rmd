@@ -3,6 +3,22 @@ title: "Modelling Demo Caravan Insurance"
 output: html_document
 ---
 
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("skimr", quietly = TRUE)) install.packages("skimr")
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+if (!requireNamespace("readr", quietly = TRUE)) install.packages("readr")
+
+#from the meeting notes
+
+marketing_cost   <- 0.89
+marketing_budget <- 50000
+revenue_per_client <- 600
+profit_margin <- 0.05
+total_market_size <- 500000
+const_seed       <- 42
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
 ```
@@ -72,19 +88,198 @@ str(churndt)
 set.seed(1234)
 
 # Generate a vector partition for data partitioning 
-partition = sample.split(churndt$CLASS, SplitRatio = 0.7) 
+partition = sample.split(churndt$CARAVAN, SplitRatio = 0.7) 
 
 # Create training set: training
-training = subset(churndt, partition == TRUE) 
+training_set = subset(churndt, partition == TRUE) 
 
 # Create test set: test
 test = subset(churndt, partition == FALSE) 
 
 ```
 
+
+# Information Gain on training set
+
+```{r}
+
+install.packages("FSelectorRcpp")
+library(FSelectorRcpp)
+
+ig <- information_gain(CARAVAN ~ ., data = training_set)
+
+# Sort descending and take top 15
+ig <- arrange(ig, desc(importance))
+print(head(ig, 20))  # peek at top 20 for context
+
+top_k <- 15
+selected_attrs <- ig$feature[seq_len(min(top_k, nrow(ig)))]
+cat("Top attributes:\n"); print(selected_attrs)
+
+# Build reduced training subset (selected predictors + target)
+subset_data <- training_set[, c(selected_attrs, "CARAVAN")]
+
+str(subset_data)
+```
+
+
+# --- Inputs ---------------------------------------------------------------
+shortlist <- c(
+  "APERSAUT","ABRAND","AWAPART",     # household product holdings
+  "PPERSAUT","PBRAND","PWAPART",     # postcode prevalence of those products
+  "MINKGEM","MKOOPKLA",              # affluence / purchase power
+  "MHKOOP","MOPLHOOG","MBERHOOG",    # housing, education, status
+  "MOSTYPE"                          # nominal -> will be excluded if non-numeric
+)
+
+# --- 1) Select existing, numeric variables --------------------------------
+vars_exist <- intersect(shortlist, names(training_set))
+is_num     <- vapply(training_set[vars_exist], is.numeric, logical(1))
+vars_num   <- vars_exist[is_num]
+
+if (length(vars_num) < 2L) stop("Need at least 2 numeric variables for correlation.")
+
+df_num <- training_set[, vars_num, drop = FALSE]
+
+# Drop zero-variance columns
+is_const <- vapply(df_num, function(x) isTRUE(var(x, na.rm = TRUE) == 0), logical(1))
+if (any(is_const)) {
+  message("Dropping zero-variance columns: ",
+          paste(names(df_num)[is_const], collapse = ", "))
+  df_num <- df_num[, !is_const, drop = FALSE]
+}
+
+if (ncol(df_num) < 2L) stop("After dropping constants, fewer than 2 variables remain.")
+
+# --- 2) Spearman correlation matrix ---------------------------------------
+cor_mat <- cor(df_num, method = "spearman", use = "pairwise.complete.obs")
+
+# Optional: take a quick look
+# print(round(cor_mat, 3))
+
+# --- 3) Build upper-tri pair list -----------------------------------------
+upper_idx <- which(upper.tri(cor_mat), arr.ind = TRUE)
+pairs_df <- data.frame(
+  var1 = rownames(cor_mat)[upper_idx[, 1]],
+  var2 = colnames(cor_mat)[upper_idx[, 2]],
+  rho  = cor_mat[upper_idx],
+  stringsAsFactors = FALSE
+)
+
+# --- 4) Flag highly correlated pairs (abs rho ≥ threshold) -----------------
+threshold <- 0.80
+pairs_df$abs_rho <- abs(pairs_df$rho)
+
+high_pairs <- pairs_df[pairs_df$abs_rho >= threshold, , drop = FALSE]
+high_pairs <- high_pairs[order(-high_pairs$abs_rho), , drop = FALSE]
+
+cat(sprintf("\nSpearman |rho| >= %.2f pairs:\n", threshold))
+if (nrow(high_pairs)) {
+  print(high_pairs, row.names = FALSE)
+} else {
+  cat("None found.\n")
+}
+
+#So as discussed with the group we found out that the P variables are assigned with the ZIP codes so we decided to drop the var1 and keep the var2 as it will be easier to target the end-client with (marketing,etc)
+
+
+# From your shortlist
+shortlist <- c(
+  "APERSAUT","ABRAND","AWAPART",
+  "PPERSAUT","PBRAND","PWAPART",
+  "MINKGEM","MKOOPKLA",
+  "MHKOOP","MOPLHOOG","MBERHOOG",
+  "MOSTYPE"
+)
+
+# Drop the postcode-prevalence (2nd) variables from the high-corr pairs
+drop_vars <- c("PWAPART","PPERSAUT","PBRAND")
+shortlist_pruned <- setdiff(shortlist, drop_vars)
+
+
 ***
 
 Next, we will learn how to build some of the predictive models. Training data would be used to train and develop our predictive models. Later, we will use test data to predict customer class (1) for churn or (0) for stay. 
+
+
+
+**Logistic Regression Model**
+
+Now, we will build logistic regression model 
+
+
+
+logistic_model <- glm(formula, data = train_data, family = binomial(link = "logit"))
+summary(logistic_model)
+
+
+
+# --- Packages ---------------------------------------------------------------
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+if (!requireNamespace("car", quietly = TRUE)) install.packages("car")
+library(pROC)
+library(caret)
+library(car)
+
+# --- Target & types ---------------------------------------------------------
+# Ensure target is factor with levels 0/1 (GLM uses 0/1 coding)
+training_set$CARAVAN <- as.factor(training_set$CARAVAN)
+test$CARAVAN        <- as.factor(test$CARAVAN)
+
+# MOSTYPE should be nominal (factor) if present
+if ("MOSTYPE" %in% names(training_set) && !is.factor(training_set$MOSTYPE)) {
+  training_set$MOSTYPE <- as.factor(training_set$MOSTYPE)
+  test$MOSTYPE        <- as.factor(test$MOSTYPE)
+}
+
+# --- Build formula from pruned features ------------------------------------
+feat <- intersect(shortlist_pruned, names(training_set))
+form_lr <- as.formula(paste("CARAVAN ~", paste(feat, collapse = " + ")))
+form_lr
+
+logit_mod <- glm(form_lr, data = training_set, family = binomial())
+
+summary(logit_mod)
+
+# Multicollinearity check (optional)
+vif_vals <- car::vif(logit_mod)
+print(vif_vals)
+
+
+# --- Logistic ROC only ------------------------------------------------------
+# Probabilities for class "1"
+p_lr <- predict(logit_mod, newdata = test, type = "response")
+
+# Ensure positive class is "1"
+actual <- factor(test$CARAVAN)  # levels should be c("0","1")
+roc_lr <- pROC::roc(response = actual, predictor = p_lr, levels = rev(levels(actual)))
+auc_lr <- pROC::auc(roc_lr)
+cat(sprintf("Logistic AUC: %.3f\n", as.numeric(auc_lr)))
+
+# Plot ROC
+plot.roc(roc_lr, legacy.axes = TRUE, col = "blue", lwd = 2,
+         xlab = "False Positive Rate (1 - Specificity)",
+         ylab = "True Positive Rate (Sensitivity)",
+         main = "ROC — Logistic Regression")
+abline(a = 0, b = 1, lty = 2)
+
+# Mark threshold = 0.50
+pt_05 <- pROC::coords(roc_lr, x = 0.5, input = "threshold",
+                      ret = c("sensitivity","specificity"))
+points(1 - pt_05["specificity"], pt_05["sensitivity"], pch = 19)
+text(1 - pt_05["specificity"], pt_05["sensitivity"], labels = "  th=0.50", pos = 4)
+
+# Mark Youden-optimal threshold
+pt_best <- pROC::coords(roc_lr, x = "best", best.method = "youden",
+                        ret = c("threshold","sensitivity","specificity"))
+points(1 - pt_best["specificity"], pt_best["sensitivity"], pch = 19)
+text(1 - pt_best["specificity"], pt_best["sensitivity"],
+     labels = sprintf("  th=%.3f", as.numeric(pt_best["threshold"])), pos = 4)
+
+legend("bottomright",
+       legend = sprintf("Logistic Reg. (AUC = %.3f)", as.numeric(auc_lr)),
+       col = "blue", lwd = 2, bty = "n")
 
 
 
@@ -111,11 +306,80 @@ library(partykit)
 ```{r  message=FALSE, eval = FALSE}
 
 # Build a decision tree by using ctree() function
-decTree <- ctree(CLASS ~ ., data = training)
+decTree <- partykit::ctree(as.formula(paste("CARAVAN ~", paste(shortlist_pruned, collapse = " + "))), data = training_set)
+
+prop.table(table(training_set$CARAVAN))
+
 
 # Print decTree
 
 print(decTree)
+
+
+# --- 0) Packages ------------------------------------------------------------
+if (!requireNamespace("partykit", quietly = TRUE)) install.packages("partykit")
+library(partykit)
+
+# --- 1) Variables (your shortlist + pruning) --------------------------------
+shortlist <- c(
+  "APERSAUT","ABRAND","AWAPART",
+  "PPERSAUT","PBRAND","PWAPART",
+  "MINKGEM","MKOOPKLA",
+  "MHKOOP","MOPLHOOG","MBERHOOG",
+  "MOSTYPE"
+)
+drop_vars <- c("PWAPART","PPERSAUT","PBRAND")
+shortlist_pruned <- setdiff(shortlist, drop_vars)
+
+# Keep only those that exist in training_set
+feat <- intersect(shortlist_pruned, names(training_set))
+
+# If MOSTYPE is present and not a factor, coerce (nominal)
+if ("MOSTYPE" %in% feat && !is.factor(training_set$MOSTYPE)) {
+  training_set$MOSTYPE <- as.factor(training_set$MOSTYPE)
+}
+if ("MOSTYPE" %in% names(test) && !is.factor(test$MOSTYPE)) {
+  test$MOSTYPE <- as.factor(test$MOSTYPE)
+}
+
+# --- 2) Build & fit the tree ------------------------------------------------
+form_pruned <- as.formula(paste("CARAVAN ~", paste(feat, collapse = " + ")))
+decTree <- partykit::ctree(form_pruned, data = training_set)
+
+# Class balance in training
+cat("Training class balance (proportions):\n")
+print(prop.table(table(training_set$CARAVAN)))
+
+# Print model summary
+cat("\nModel summary:\n")
+print(decTree)
+
+# --- 3) Tree size & depth ---------------------------------------------------
+# number of terminal (leaf) nodes
+n_leaves <- length(partykit::nodeids(decTree, from = "terminal"))
+# number of inner (split) nodes
+n_inner  <- length(partykit::nodeids(decTree, from = "inner"))
+
+# helper to compute maximum depth (height) of the tree
+tree_depth <- function(tree) {
+  recurse <- function(nd) {
+    kids <- partykit::kids_node(nd)
+    if (length(kids) == 0L) return(1L)
+    1L + max(vapply(kids, recurse, integer(1L)))
+  }
+  recurse(partykit::node_party(tree))
+}
+
+cat("\nTree stats:\n")
+cat("Leaves:", n_leaves, " | Inner nodes:", n_inner, " | Max depth (nodes):", tree_depth(decTree), "\n")
+
+# --- 4) Quick evaluation on test -------------------------------------------
+pred <- predict(decTree, newdata = test, type = "response")
+acc  <- mean(pred == test$CARAVAN)
+cat(sprintf("\nTest accuracy: %.3f\n", acc))
+
+# Optional: simple plot
+# plot(decTree, type = "simple")
 
 ```
 
@@ -125,7 +389,7 @@ print(decTree)
 ```{r  message=FALSE, eval = FALSE}
 
 # Build a decision tree by using features HOUSE and AVG_OVERCHARGE
-DT <- ctree(CLASS ~ ---, data = training)
+DT <- ctree(CLASS ~ ---, data = training_set)
 
 # Print DT
 print(DT)
@@ -267,7 +531,7 @@ library(e1071)
 ```{r  message=FALSE, eval = FALSE}
 
 # Build an SVM model by using svm() function
-svm_radial <- svm(CLASS ~ ., data = training, kernel = "radial", scale = TRUE)
+svm_radial <- svm(CLASS ~ ., data = training_set, kernel = "radial", scale = TRUE)
 
 # Print svm_radial
 print(svm_radial)
