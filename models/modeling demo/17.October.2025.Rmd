@@ -1,0 +1,1210 @@
+---
+title: "Modelling Demo Caravan Insurance"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+This is our project for Predictive Analytics
+
+# Project Overview
+
+Following our initial meeting, we aligned on a business goal of
+**profitable growth** in the Caravan segment. The campaign will use
+personalized letters to existing customers and we will leverage
+predictive modeling to prioritize whom to contact.
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Business Inputs (from interview)
+
+
+-   **Budget (B):** €50,000\
+-   **Cost per contact (c):** €0.89 (letter)\
+-   **Revenue per new Caravan policy (R):** €600 p.a.\
+-   **Profit margin (m):** 5%\
+-   **Total addressable base:** 500,000 customers\
+-   **Random seed (reproducibility):** 42
+
+## Derived KPIs (used throughout)
+
+We’ll compute: - **Profit per conversion:** $p = R \times m$\
+- **Max contacts under budget:**
+$N_{\text{budget}} = \left\lfloor \dfrac{B}{c} \right\rfloor$\
+- **Breakeven precision:**
+$\text{Precision}_{\text{min}} = \dfrac{c}{p}$\
+(minimum positive rate among contacted customers needed to avoid losses)
+
+These KPIs translate model scores into actionable,
+**budget-constrained** outreach plans.
+
+## Modeling Objective
+
+Build a propensity model that ranks customers by likelihood to buy
+**Caravan**. We’ll compare operating strategies:
+
+1.  **Top-N (Budget-Constrained):** Contact the top $N_{\text{budget}}$
+    customers by predicted probability.\
+2.  **Profit-Optimal Threshold:** Choose a probability cutoff that
+    maximizes expected profit.
+
+For both, we will report **Precision, Recall, Lift, AUC/PR-AUC, Profit,
+ROI**, and recommend the plan that best aligns with “**maximize growth
+while staying profitable**.”
+
+## Data & Method (high level)
+
+-   **Dataset:** ticdata2000 (cleaned snapshot).\
+-   **Split:** 70% **training** / 30% **test** (seed = 1234).\
+-   **Features:** Household-level predictors prioritized; highly
+    correlated postcode prevalence variables dropped to reduce
+    redundancy.\
+-   **Models:** Logistic Regression (baseline), Conditional Inference
+    Tree (interpretable).\
+-   **Evaluation:** ROC/AUC, PR-AUC (for class imbalance), calibration
+    (HL test + decile plot), and **business KPIs** under Top-N and
+    profit-optimal threshold.
+
+## Decision & Deployment
+
+-   Select the operating plan with **higher profit** (and acceptable
+    precision).\
+-   **Pilot** (A/B) on a small slice (e.g., 2 weeks), verify conversion
+    uplift and realized profit, then scale.
+
+------------------------------------------------------------------------
+
+### Business inputs (code)
+
+```{r}
+marketing_cost       <- 0.89
+marketing_budget     <- 50000
+revenue_per_client   <- 600
+profit_margin        <- 0.05
+total_market_size    <- 500000
+const_seed           <- 42
+
+# Derived KPIs
+profit_per_win <- revenue_per_client * profit_margin            # € per true positive
+n_budget       <- floor(marketing_budget / marketing_cost)       # max letters
+breakeven_prec <- marketing_cost / profit_per_win                # min precision to break even
+
+cat(sprintf("Profit per policy: €%.2f | Max contacts: %d | Breakeven precision: %.3f\n",
+            profit_per_win, n_budget, breakeven_prec))
+```
+
+```{r}
+
+library(tidyverse)
+library(caTools) 
+
+# Import our data and assing it to churndt
+churndt <- read.csv('/Users/alenslaskovs/Desktop/WHU/PA/GroupWork/MSc_Predictive_Analytics_HS25_Group_Assignment/models/modeling demo/ticdata2000_clean.csv')
+
+#churndt <- read.csv("C:/Users/antealocal/OneDrive - WHU/Q1/Predictive Analytics/Assessment/ticdata2000_clean.csv")
+
+# Display the structure of the dataset
+
+head(churndt, 10)
+
+# target as factor with readable labels
+churndt$CARAVAN <- factor(churndt$CARAVAN, levels = c(0,1), labels = c("no","yes"))
+
+# MOSTYPE: treat as categorical and collapse rare levels (prettier trees)
+churndt$MOSTYPE <- fct_lump_n(factor(churndt$MOSTYPE), n = 10)
+
+```
+
+------------------------------------------------------------------------
+
+-   Split the dataset into the training (70%) and test (30%) sets by
+    using `sample.split()` function.
+
+```{r}
+
+# Set a seed
+
+const_seed <- 1234
+set.seed(const_seed)
+
+# Generate a vector partition for data partitioning 
+partition = sample.split(churndt$CARAVAN, SplitRatio = 0.7) #stratified split
+
+# Create training set: training
+training_set = subset(churndt, partition == TRUE) 
+
+# Create test set: test
+test = subset(churndt, partition == FALSE) 
+
+library(dplyr)
+
+# Check: % YES in each set 
+summary_yes <- tibble(
+  set = c("train", "test"),
+  n = c(nrow(training_set), nrow(test)),
+  pct_yes = round(100 * c(mean(training_set$CARAVAN == "yes"),
+                          mean(test$CARAVAN == "yes")), 3)
+)
+
+print(summary_yes)
+
+```
+
+# Balancing the dataset
+
+DO WE NEED TO BALANCE THE DATASET? Data balancing (through oversampling
+or undersampling) could be done to address class imbalance. In our case
+one class CARAVAN occurs far less frequently than NO CARAVAN.
+
+```{r}
+
+library(ROSE)
+# Perform oversampling on the training set to balance the target variable (CARAVAN)
+training_bal <- ovun.sample(CARAVAN ~ ., data = training_set, method = "over")$data
+
+# Check the class distribution before oversampling
+prop.table(table(training_set$CARAVAN))
+# Check the class distribution after oversampling
+prop.table(table(training_bal$CARAVAN))
+
+traning_set <- training_bal
+```
+
+# Information Gain on training set
+
+```{r}
+
+library(FSelectorRcpp)
+
+ig <- information_gain(CARAVAN ~ ., data = training_set)
+
+# Sort descending and take top 15
+ig <- arrange(ig, desc(importance))
+print(head(ig, 20))  # peek at top 20 for context
+
+top_k <- 15
+selected_attrs <- ig$feature[seq_len(min(top_k, nrow(ig)))]
+cat("Top attributes:\n"); print(selected_attrs)
+
+# Build reduced training subset (selected predictors + target)
+subset_data <- training_set[, c(selected_attrs, "CARAVAN")]
+
+str(subset_data)
+```
+
+```{r Variable choice}
+# This are our variables that we picked based on information gain
+shortlist <- c(
+  "APERSAUT","ABRAND","AWAPART",     # household product holdings
+  "PPERSAUT","PBRAND","PWAPART",     # postcode prevalence of those products
+  "MINKGEM","MKOOPKLA",              # affluence / purchase power
+  "MHKOOP","MOPLHOOG","MBERHOOG",    # housing, education, status
+  "MOSTYPE"                          # nominal -> will be excluded if non-numeric
+)
+```
+
+IS THIS REALLY A GOOD CHOICE???????
+
+```{r}
+# select numeric variables
+vars_exist <- intersect(shortlist, names(training_set))
+is_num     <- vapply(training_set[vars_exist], is.numeric, logical(1))
+vars_num   <- vars_exist[is_num]
+
+if (length(vars_num) < 2L) stop("Need at least 2 numeric variables for correlation.")
+
+df_num <- training_set[, vars_num, drop = FALSE]
+
+# Drop zero-variance columns
+is_const <- vapply(df_num, function(x) isTRUE(var(x, na.rm = TRUE) == 0), logical(1))
+if (any(is_const)) {
+  message("Dropping zero-variance columns: ",
+          paste(names(df_num)[is_const], collapse = ", "))
+  df_num <- df_num[, !is_const, drop = FALSE]
+}
+
+if (ncol(df_num) < 2L) stop("After dropping constants, fewer than 2 variables remain.")
+
+# Spearman correlation matrix
+cor_mat <- cor(df_num, method = "spearman", use = "pairwise.complete.obs")
+
+print(round(cor_mat, 3))
+
+# Build upper-tri pair list
+upper_idx <- which(upper.tri(cor_mat), arr.ind = TRUE)
+pairs_df <- data.frame(
+  var1 = rownames(cor_mat)[upper_idx[, 1]],
+  var2 = colnames(cor_mat)[upper_idx[, 2]],
+  rho  = cor_mat[upper_idx],
+  stringsAsFactors = FALSE
+)
+
+# Flag highly correlated pairs (abs rho ≥ threshold) 
+threshold <- 0.80
+pairs_df$abs_rho <- abs(pairs_df$rho)
+
+high_pairs <- pairs_df[pairs_df$abs_rho >= threshold, , drop = FALSE]
+high_pairs <- high_pairs[order(-high_pairs$abs_rho), , drop = FALSE]
+
+cat(sprintf("\nSpearman |rho| >= %.2f pairs:\n", threshold))
+if (nrow(high_pairs)) {
+  print(high_pairs, row.names = FALSE)
+} else {
+  cat("None found.\n")
+}
+
+
+
+# Drop the postcode-prevalence (2nd) variables from the high-corr pairs
+drop_vars <- c("PWAPART","PPERSAUT","PBRAND")
+shortlist_pruned <- setdiff(shortlist, drop_vars)
+```
+
+So as discussed with the group we found out that the P variables are
+assigned with the ZIP codes so we decided to drop the var1 and keep the
+var2 as it will be easier to target the end-client with (marketing,etc)
+
+Next, we will learn how to build some of the predictive models. Training
+data would be used to train and develop our predictive models. Later, we
+will use test data to predict customer class (1) for churn or (0) for
+stay.
+
+# Unsupervised Learning
+
+Uses numeric vars from shortlist_pruned, excludes CARAVAN, scales on
+training only, elbow + kneedle to suggest k, fits k = 6 and k = optimal,
+profiles vs CARAVAN,and adds cluster labels to training_set and test as:
+cluster_k6, cluster_ok. \# --- K-means: setup
+----------------------------------------------------------- We will:
+
+1)  pick numeric features from shortlist_pruned (excluding CARAVAN)
+2)  prep TRAIN (drop NA/constant cols) and scale (store center/scale)
+3)  elbow + kneedle to suggest k
+4)  fit FINAL k (set to 3 here)
+5)  assign clusters to TRAIN and TEST (nearest center on scaled space)
+6)  profile clusters vs CARAVAN
+
+```{r K means clustering}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(tidyselect)
+
+
+```
+
+```{r Feature selection}
+# Keep only numeric predictors from your shortlist_pruned (no CARAVAN).
+vars_km <- intersect(shortlist_pruned, names(training_set))
+vars_km <- setdiff(vars_km, "CARAVAN")
+vars_km <- vars_km[vapply(training_set[vars_km], is.numeric, logical(1))]
+
+if (length(vars_km) < 2L) {
+  stop("Need at least 2 numeric variables for k-means. Check shortlist_pruned.")
+}
+
+# Build TRAIN input, drop rows with missing values
+km_train <- training_set %>%
+  dplyr::mutate(row_id = dplyr::row_number()) %>%
+  dplyr::select(row_id, tidyselect::all_of(vars_km)) %>%
+  tidyr::drop_na()
+
+
+X_train <- km_train %>% dplyr::select(-row_id)
+
+# Drop zero-variance columns (if any)
+is_const <- vapply(X_train, function(x) isTRUE(stats::var(x, na.rm = TRUE) == 0), logical(1))
+if (any(is_const)) {
+  message("Dropping zero-variance columns for k-means: ",
+          paste(names(X_train)[is_const], collapse = ", "))
+  X_train <- X_train[, !is_const, drop = FALSE]
+}
+if (ncol(X_train) < 2L) stop("After dropping constants, fewer than 2 variables remain.")
+
+vars_km_used <- colnames(X_train)  # the final variables used
+
+```
+
+```{r Scale TRAIN & helpers}
+
+# Scale TRAIN and save center/scale so we can assign TEST consistently
+
+X_train_scaled <- scale(X_train)
+X_center <- attr(X_train_scaled, "scaled:center")
+X_scale  <- attr(X_train_scaled, "scaled:scale")
+
+# Helper to bring cluster centers back to original units (nice for interpretation)
+unscale_centers <- function(centers_scaled, center_vec, scale_vec){
+  sweep(sweep(centers_scaled, 2, scale_vec, `*`), 2, center_vec, `+`)
+}
+
+```
+
+```{r}
+# --- Elbow + kneedle (for info/plot) -----------------------------------------
+# We compute WCSS for k=1..10 and pick the k with max distance to the k=1..max line.
+
+max_k <- 10
+wcss <- sapply(1:max_k, function(k){
+  kmeans(X_train_scaled, centers = k, nstart = 50, iter.max = 100)$tot.withinss
+})
+
+plot(1:max_k, wcss, type = "b", pch = 19,
+     xlab = "Number of clusters (k)",
+     ylab = "Total within-cluster sum of squares (WCSS)",
+     main = "Elbow method for k-means")
+
+k_vals <- 1:max_k
+line_start <- c(k_vals[1], wcss[1])
+line_end   <- c(k_vals[max_k], wcss[max_k])
+dist_point_line <- function(p, a, b) {
+  num <- abs((b[1]-a[1])*(a[2]-p[2]) - (a[1]-p[1])*(b[2]-a[2]))
+  den <- sqrt((b[1]-a[1])^2 + (b[2]-a[2])^2)
+  num / den
+}
+dists <- sapply(seq_along(k_vals),
+                function(i) dist_point_line(c(k_vals[i], wcss[i]), line_start, line_end))
+optimal_k <- which.max(dists)
+abline(v = optimal_k, lty = 2)
+
+cat("Kneedle suggested:", optimal_k, "\n")
+
+```
+
+-   Big drops from k=1→2 and 2→3, then much smaller gains.
+-   The dashed line at k=3 is a reasonable “knee”: 3 clusters capture
+    most structure; more clusters are diminishing returns.
+-   Action: keep k=3 for a clean story
+
+```{r Fit FINAL and inspect centers}
+
+
+# Use k_final = 3 as you concluded (set k_final <- optimal_k if you prefer auto).
+k_final <- 3
+cat("Final k used:", k_final, "\n")
+
+kmeans_ok <- kmeans(X_train_scaled, centers = k_final, nstart = 50, iter.max = 100)
+centers_ok_scaled   <- kmeans_ok$centers
+centers_ok_unscaled <- unscale_centers(centers_ok_scaled, X_center, X_scale)
+
+cat("\n=== k =", k_final, "results (training) ===\n")
+cat("Cluster sizes:\n"); print(table(kmeans_ok$cluster))
+cat("\nScaled centers:\n"); print(round(centers_ok_scaled, 3))
+cat("\nUnscaled centers (original units):\n"); print(round(centers_ok_unscaled, 3))
+
+```
+
+
+```{r}
+# --- Attach cluster labels to TRAIN ------------------------------------------
+# We only have cluster labels for complete-case rows used by k-means.
+assign_ok_train <- tibble::tibble(
+  row_id = km_train$row_id,
+  cluster_ok = factor(kmeans_ok$cluster, levels = seq_len(k_final))
+)
+
+training_set_km <- training_set %>%
+  dplyr::mutate(row_id = dplyr::row_number()) %>%
+  dplyr::left_join(assign_ok_train, by = "row_id") %>%
+  dplyr::select(-row_id)
+```
+
+```{r}
+# --- Assign TEST rows to nearest center
+
+# Complete-case Subset aus TEST für die Zuordnung 
+test_cc <- test %>%
+  dplyr::mutate(row_id = dplyr::row_number()) %>%
+  dplyr::select(row_id, tidyselect::all_of(vars_km_used)) %>%
+  tidyr::drop_na()
+
+# Mit TRAIN-Center/Scale skalieren
+X_test <- as.data.frame(test_cc[, vars_km_used, drop = FALSE])
+X_test_scaled <- sweep(X_test, 2, X_center, "-")
+X_test_scaled <- sweep(X_test_scaled, 2, X_scale,  "/")
+
+# Nächste-Zentren-Zuordnung (quadr. euklidisch im skalierten Raum)
+assign_to_centers <- function(M, centers){
+  apply(M, 1, function(x){
+    which.min(rowSums((centers - matrix(x, nrow = nrow(centers),
+                                        ncol = length(x), byrow = TRUE))^2))
+  })
+}
+idx <- assign_to_centers(as.matrix(X_test_scaled), centers_ok_scaled)
+
+assign_ok_test <- tibble::tibble(
+  row_id    = test_cc$row_id,
+  cluster_ok = factor(idx, levels = seq_len(nrow(centers_ok_scaled)))
+)
+
+# Augmentierte TEST-Kopie bauen 
+test_km <- test %>%
+  dplyr::mutate(row_id = dplyr::row_number()) %>%
+  dplyr::left_join(assign_ok_test, by = "row_id") %>%
+  dplyr::select(-row_id)
+
+
+
+
+```
+
+```{r}
+# Quick profiling vs CARAVAN (TRAIN & TEST) 
+# For interpretation only (DO NOT use test cluster labels to change anything in training).
+
+suppressPackageStartupMessages({ library(dplyr) })
+
+# Helper: profile by cluster with lift vs dataset base rate
+profile_by_cluster <- function(df, k_final, label = "DATASET") {
+  stopifnot("cluster_ok" %in% names(df), "CARAVAN" %in% names(df))
+  if (!is.factor(df$CARAVAN)) {
+    df$CARAVAN <- factor(df$CARAVAN, levels = c("no","yes"))
+  }
+  base_rate <- mean(df$CARAVAN == "yes", na.rm = TRUE)
+
+  out <- df %>%
+    dplyr::filter(!is.na(cluster_ok)) %>%
+    dplyr::group_by(cluster_ok) %>%
+    dplyr::summarise(
+      n         = dplyr::n(),
+      conv_rate = mean(CARAVAN == "yes"),
+      lift      = conv_rate / base_rate,
+      .groups   = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(conv_rate))
+
+  cat(sprintf("\n=== %s: Cluster profiling vs CARAVAN (k = %s) ===\n", label, k_final))
+  cat(sprintf("Base rate (overall %s): %.3f\n", label, base_rate))
+  print(out)
+  invisible(out)
+}
+
+# Decide which data frames to use WITHOUT overwriting originals
+train_for_prof <- if (exists("training_set_km")) training_set_km else training_set
+test_for_prof  <- if (exists("test_km")) test_km else test
+
+# TRAINING profile
+if ("cluster_ok" %in% names(train_for_prof) && is.factor(train_for_prof$CARAVAN)) {
+  profile_by_cluster(train_for_prof, k_final, "TRAINING")
+} else {
+  message("Skipping TRAINING profile: missing 'cluster_ok' or CARAVAN not factor.")
+}
+
+# TEST profile (uses test_km if available)
+if ("cluster_ok" %in% names(test_for_prof) && is.factor(test_for_prof$CARAVAN)) {
+  profile_by_cluster(test_for_prof, k_final, "TEST")
+} else {
+  message("Skipping TEST profile: missing 'cluster_ok' or CARAVAN not factor.")
+}
+
+
+```
+
+## K-means (k = 3): Cluster performance vs **CARAVAN**
+
+**What the table shows**
+
+-   `n` = number of customers in the cluster.\
+-   `conv_rate` = share with **CARAVAN = "yes"** (conversion rate).\
+-   `lift` = `conv_rate / base_rate`. A lift of 1.50 means the cluster
+    converts **50% above** the dataset average.\
+-   Base rate (overall): **6.0%** in **TRAINING** and **TEST**.
+
+### TRAINING results (k = 3)
+
+| cluster |    n | conv_rate |      lift |
+|--------:|-----:|----------:|----------:|
+|   **3** |  954 | **9.43%** | **1.58×** |
+|   **1** | 1250 | **7.36%** | **1.23×** |
+|   **2** | 1872 | **3.31%** | **0.55×** |
+
+**Interpretation (train):** - **Cluster 3** is the clear **hot segment**
+(≈9.4% conv; \~58% above average). - **Cluster 1** is **above average**
+(≈7.4%; +23%). - **Cluster 2** is **below average** (≈3.3%; \~45%
+below).
+
+### TEST results (k = 3)
+
+| cluster |   n |  conv_rate |      lift |
+|--------:|----:|-----------:|----------:|
+|   **3** | 400 | **11.13%** | **1.89×** |
+|   **1** | 553 |  **5.06%** | **0.85×** |
+|   **2** | 793 |  **3.91%** | **0.66×** |
+
+**Interpretation (test / generalisation):** - **Cluster 3** **holds up
+and even strengthens** on test (≈11.1% conv; \~1.9× lift). This looks
+like the **prime target profile**. - **Cluster 1** drops below the base
+rate on test (≈5.1%; 0.85×). On training it was above average, so this
+segment is **less stable**—treat as **medium priority**. - **Cluster 2**
+remains **consistently weak** (≈3.9%; \~0.66×).
+
+### What this means for the project
+
+-   Use the cluster label **as a feature** in your supervised model,
+    rather than targeting purely by cluster. Clustering is
+    **descriptive**; the mail decision should come from the **predicted
+    probability / profit model**.
+-   For campaign planning (communication tone/offer design), **Cluster
+    3** deserves the **primary focus**; **Cluster 1** is a **maybe**
+    (validate with model scores); **Cluster 2** is **low priority**.
+-   These results are **internally consistent** with the earlier center
+    summaries: the “affluent / higher-status” profile aligns with the
+    **high-lift** cluster.
+
+> If you want to translate this to unit economics with your assumptions
+> (€30 profit per conversion, €0.85 per letter), the break-even
+> probability is ≈2.83%. All clusters are above break-even, but
+> **Cluster 3** yields the **highest ROI per mail**, so it should
+> consume a disproportionate share of the budget—**subject to** the
+> supervised model’s ranking and the €50k cap.
+
+```{r}
+# --- Top 5 differentiators per cluster (z vs overall mean) -------------------
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(forcats); library(tidyselect)
+})
+
+# Use augmented training set if available
+train_for_plot <- if (exists("training_set_km")) training_set_km else training_set
+
+# Safety checks
+stopifnot("cluster_ok" %in% names(train_for_plot))
+stopifnot(exists("vars_km_used"), exists("X_center"), exists("X_scale"))
+
+# Helper: standardize with same params used in k-means training
+scale_with_train_params <- function(df, vars, center, scale){
+  out <- df %>% dplyr::select(tidyselect::all_of(vars))
+  for (v in vars) out[[v]] <- (out[[v]] - center[[v]]) / scale[[v]]
+  out
+}
+
+# 1) Standardize the training data in k-means space
+Z_train <- scale_with_train_params(train_for_plot, vars_km_used, X_center, X_scale)
+
+# 2) Compute cluster mean z for each feature
+centers_long <- dplyr::bind_cols(cluster_ok = train_for_plot$cluster_ok, Z_train) %>%
+  dplyr::filter(!is.na(cluster_ok)) %>%
+  dplyr::group_by(cluster_ok) %>%
+  dplyr::summarise(dplyr::across(tidyselect::all_of(vars_km_used), ~ mean(.x, na.rm = TRUE)),
+                   .groups = "drop") %>%
+  tidyr::pivot_longer(cols = -cluster_ok, names_to = "feature", values_to = "z_mean")
+
+# 3) Pick top 5 features per cluster by |z|  (FIX: n must be constant)
+top_k <- 5
+top5 <- centers_long %>%
+  dplyr::group_by(cluster_ok) %>%
+  dplyr::slice_max(order_by = abs(z_mean), n = top_k, with_ties = FALSE) %>%  # <- fixed
+  dplyr::ungroup()
+
+install.packages(pretty_map)
+
+top5 <- top5 %>%
+  dplyr::mutate(
+    # schöne Namen; nicht gemappte Features bleiben unverändert
+    feature_pretty = dplyr::recode(feature, !!!pretty_map, .default = feature),
+    # nach |z| sortieren (Top oben)
+    feature_pretty = forcats::fct_reorder(feature_pretty, abs(z_mean), .desc = TRUE),
+    # Cluster-Label C1/C2/C3
+    cluster_lab    = forcats::fct_relabel(as.factor(cluster_ok), ~ paste0("C", .x))
+  )
+
+
+```
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(forcats) 
+
+# Cluster Labels
+top5 <- top5 %>%
+  mutate(
+    # Falls 'cluster_lab' noch nicht existiert:
+    cluster_lab = if (!"cluster_lab" %in% names(.)) forcats::fct_relabel(as.factor(cluster_ok), ~ paste0("C", .x)) else cluster_lab,
+    cluster_lab = forcats::fct_relevel(cluster_lab, "C1","C2","C3")
+  )
+
+```
+
+## Who is **Cluster 3**? (k = 3)
+
+**Bottom line:** Cluster 3 are **affluent, higher-status homeowners**
+who already hold **several other P&C products**. They respond **well
+above average** to Caravan offers.
+
+### Evidence from our results
+
+-   **Performance:**
+    -   **Training:** conv_rate = **9.4%** (lift **1.58×** vs 6.0%
+        base).\
+    -   **Test:** conv_rate = **11.1%** (lift **1.89×** vs 6.0% base).\
+        → The uplift **generalizes** to the holdout set, so the segment
+        is stable.
+-   **Centres (direction of deviation vs overall):**
+    -   **Affluence / status / housing (M\* variables):** **well above
+        average**
+        -   `MINKGEM` (avg. income): **+** (≈ +1 SD)\
+        -   `MKOOPKLA` (purchasing power class): **++** (≈ +1.1 SD)\
+        -   `MHKOOP` (home ownership): **++** (highest of the three
+            clusters)\
+        -   `MOPLHOOG` (higher education): **+**\
+        -   `MBERHOOG` (higher social status): **+**\
+    -   **Other products held (A\* variables):** **slightly above
+        average**
+        -   `APERSAUT` (car), `ABRAND` (fire), `AWAPART` (liability):
+            **+** each (small +).
+
+> Interpretation: financially stronger households, typically
+> **homeowners** with **higher education/status**, and they already hold
+> **multiple non-Caravan policies**. This is a classic
+> **cross-sell-ready** audience for a Caravan product.
+
+### Practical persona
+
+-   **Household:** homeowner, high purchasing power,
+    well-educated/professional status.\
+-   **Insurance footprint:** already carries car + home/fire + liability
+    (multi-policy).\
+-   **Response pattern:** converts at **\~11%** on test (**\~1.9×**
+    base).\
+-   **Risks:** few—segment is consistent across train/test.\
+-   **Comms angle:** premium tone, emphasize **bundle/loyalty
+    discounts** and **coverage upgrades**; lean into **homeownership &
+    travel** convenience.
+
+```{r}
+
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(forcats)
+
+# Fixierte Features
+fixed_features <- c(
+  "MBERHOOG", "MKOOPKLA", "ABRAND", "MINKGEM", "MOPLHOOG", "MHKOOP", "AWAPART"
+)
+
+labeled_map <- c(
+  MBERHOOG = "High status",
+  MKOOPKLA = "Purchasing power",
+  ABRAND = "Fire insurance (HH)",
+  MINKGEM = "Income (index)",
+  MOPLHOOG = "High education",
+  MHKOOP = "Home ownership",
+  AWAPART = "Liability (HH)"
+)
+
+# Plot-Daten vorbereiten
+plot_df <- centers_long %>%
+  filter(feature %in% fixed_features) %>%
+  mutate(
+    feature_label = recode(feature, !!!labeled_map, .default = feature),
+    feature_label = factor(
+      feature_label,
+      levels = rev(recode(fixed_features, !!!labeled_map, .default = fixed_features))
+    ),
+    cluster_lab = fct_relabel(as.factor(cluster_ok), ~ paste0("C", .x)),
+    sign = ifelse(z_mean >= 0, "pos", "neg")
+  )
+
+# Einheitliche x-Achse & Farben
+rng <- max(abs(plot_df$z_mean), na.rm = TRUE)
+pad <- 0.15
+xlim <- c(-rng - pad, rng + pad)
+pal <- c(neg = "#D73027", pos = "#1A9850")
+
+# Plot-Funktion für einen Cluster
+plot_cluster <- function(cluster_name) {
+  ggplot(filter(plot_df, cluster_lab == cluster_name),
+         aes(x = z_mean, y = feature_label, colour = sign)) +
+    geom_vline(xintercept = 0, linewidth = 0.4, linetype = 3, color = "grey50") +
+    geom_segment(aes(x = 0, xend = z_mean, yend = feature_label), linewidth = 1, lineend = "round") +
+    geom_point(size = 3) +
+    scale_x_continuous(limits = xlim, expand = expansion(mult = c(0, 0))) +
+    scale_colour_manual(values = pal, labels = c(neg = "below mean", pos = "above mean"), name = NULL) +
+    coord_cartesian(clip = "off") +
+    labs(
+      title = paste("Cluster", cluster_name),
+      subtitle = "z vs overall training mean",
+      x = "Standardized deviation (z)",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.y = element_text(hjust = 1),
+      legend.position = "top",
+      plot.margin = margin(t = 12, r = 40, b = 12, l = 28)
+    )
+}
+
+# Plot einzeln anzeigen
+plot_cluster("C1")
+plot_cluster("C2")
+plot_cluster("C3")
+
+```
+
+# (New) Decision Tree and Evaluation
+
+```{r Packages}
+library(partykit) #decision tree model ctree
+library(naivebayes) #NaiveBayes model
+library(pROC) #pROC chart library
+library(MASS) #LDA model
+library(caret) #Confusion matrix library   
+```
+
+```{r Features}
+features_used <- intersect(shortlist_pruned, names(training_set))
+fT3 <- as.formula(paste("CARAVAN ~", paste(features_used, collapse = "+")))
+columns <- c(features_used, "CARAVAN")
+
+```
+
+```{r Ensure target is factor and align test set}
+training_set$CARAVAN <- factor(training_set$CARAVAN)
+test_set <- test
+test_set$CARAVAN <- factor(test_set$CARAVAN, levels = levels(training_set$CARAVAN))
+```
+
+
+```{r Decision Tree T2}
+# Cost-sensitive, compact ctree 
+# weight positives to counter class imbalance
+# --- 0) Build the exact modelling frame once ---
+stopifnot("CARAVAN" %in% columns)               # make sure target is in columns
+df <- training_set[, columns]
+
+# ensure target is factor with the right positive label
+df$CARAVAN <- factor(df$CARAVAN)
+if (!all(c("no","yes") %in% levels(df$CARAVAN))) {
+  # if levels are reversed or different, coerce to (no, yes)
+  df$CARAVAN <- factor(df$CARAVAN, levels = c("no","yes"))
+}
+pos_lab <- "yes"
+
+# (optional) drop rows with any NA used by the model to keep w aligned
+df <- na.omit(df)
+
+# --- 1) Class weights computed on df (not on the larger training_set) ---
+pos_n <- sum(df$CARAVAN == pos_lab)
+neg_n <- sum(df$CARAVAN != pos_lab)
+w <- ifelse(df$CARAVAN == pos_lab, neg_n / pos_n, 1)
+
+# --- 2) CTREE version ---
+library(partykit)
+ctrl <- ctree_control(
+  maxdepth     = 4,
+  minsplit     = 200,
+  minbucket    = 100,
+  mincriterion = 0.90
+)
+decTree_T2 <- ctree(fT3, data = df, weights = w, control = ctrl)
+
+# Plot (ctree)
+library(grid)
+plot(decTree_T2,
+     inner_panel    = node_inner(decTree_T2, id = FALSE, pval = TRUE),
+     terminal_panel = node_terminal(decTree_T2, digits = 2, abbreviate = FALSE, id = FALSE),
+     gp = gpar(fontsize = 8))
+
+# --- 3) RPART version (for rpart.plot styling) ---
+library(rpart)
+library(rpart.plot)
+
+decTree_T2_rpart <- rpart(
+  formula  = fT3,
+  data     = df,
+  weights  = w,
+  method   = "class",
+  control  = rpart.control(
+    maxdepth   = 4,
+    minsplit   = 200,
+    minbucket  = 100,
+    cp         = 0.0
+  ),
+  parms = list(split = "gini") # or "information"
+)
+
+# Pretty split label wrapper (unchanged)
+pretty_map <- c(
+  MBERHOOG = "High status",
+  MKOOPKLA = "Purchasing power (area)",
+  ABRAND   = "Fire insurance (HH)",
+  MINKGEM  = "Income (index)",
+  MOPLHOOG = "High education",
+  MHKOOP   = "Home ownership",
+  AWAPART  = "Liability (HH)",
+  APERSAUT = "Number of car policies",
+  MOSTYPE  = "Customer subtype"
+)
+pretty_splits <- function(x, labs, digits, varlen, faclen) {
+  labs <- as.character(labs)
+  for (nm in names(pretty_map)) {
+    labs <- gsub(paste0("\\b", nm, "\\b"), pretty_map[[nm]], labs, perl = TRUE)
+  }
+  vapply(labs, function(s) paste(strwrap(s, width = 18), collapse = "\n"), character(1))
+}
+
+# Plot (rpart)
+rpart.plot::rpart.plot(
+  decTree_T2_rpart,
+  type            = 2,
+  extra           = 104,
+  under           = TRUE,
+  fallen.leaves   = TRUE,
+  faclen          = 0,
+  varlen          = 0,
+  digits          = -3,
+  main            = "Caravan Propensity — Cost-Sensitive Tree",
+  uniform         = TRUE,
+  compress        = FALSE,
+  minbranch       = 0.85,
+  tweak           = 1.35,
+  split.cex       = 0.95,
+  under.cex       = 0.90,
+  branch.lwd      = 2,
+  branch.col      = "grey40",
+  box.palette     = "RdYlGn",
+  shadow.col      = "grey90",
+  yesno           = 2,
+  nn              = TRUE,
+  clip.right.labs = FALSE,
+  split.fun       = pretty_splits
+)
+
+
+
+
+```
+
+```{r}
+print(decTree_T2)
+```
+```{r Evaluation}
+
+library(caret)
+library(pROC)
+
+# business cutoff + profit-maximizing threshold 
+# Assumptions 
+profit_per_conv <- 30      # € profit per conversion
+cost_mail       <- 0.85    # € cost per mailing
+cutoff          <- cost_mail / profit_per_conv  # break-even prob ≈ 0.0283
+pos_lab         <- "yes"   # positive class label in test$CARAVAN
+
+# Score the test set with your fitted tree (decTree_T2) 
+p_dt2 <- predict(decTree_T2, newdata = test, type = "prob")[, pos_lab]
+
+# Metrics at business break-even cutoff 
+pred_cut <- factor(ifelse(p_dt2 >= cutoff, pos_lab, "no"),
+                   levels = levels(test$CARAVAN))
+cm_cut   <- confusionMatrix(pred_cut, test$CARAVAN, positive = pos_lab)
+auc_dt2  <- auc(response = test$CARAVAN, predictor = p_dt2)
+
+profit_cut <- sum(ifelse(p_dt2 >= cutoff,
+                         ifelse(test$CARAVAN == pos_lab,
+                                profit_per_conv - cost_mail, -cost_mail),
+                         0))
+
+# * Profit-maximizing threshold over a simple grid 
+ths <- sort(unique(c(0, quantile(p_dt2, probs = seq(0, 1, 0.01)))))
+
+profit_of <- function(t){
+  mail <- p_dt2 >= t
+  sum(ifelse(mail,
+             ifelse(test$CARAVAN == pos_lab, profit_per_conv - cost_mail, -cost_mail),
+             0))
+}
+
+profits <- sapply(ths, profit_of)
+t_star  <- ths[which.max(profits)]
+
+pred_star <- factor(ifelse(p_dt2 >= t_star, pos_lab, "no"),
+                    levels = levels(test$CARAVAN))
+cm_star   <- confusionMatrix(pred_star, test$CARAVAN, positive = pos_lab)
+profit_star <- max(profits)
+
+```
+
+```{r Summary table}
+# Full summary table 
+library(dplyr)
+library(tibble)
+library(knitr)
+
+# Formatters
+fmt_pct <- function(x) sprintf("%.2f%%", 100 * as.numeric(x))
+fmt_eur <- function(x) sprintf("€%s", formatC(as.numeric(x), format = "f", digits = 2, big.mark = ","))
+fmt_int <- function(x) format(as.integer(x), big.mark = ",")
+
+# Counts & rates
+mailed_cut  <- sum(p_dt2 >= cutoff)
+mailed_star <- sum(p_dt2 >= t_star)
+n_test      <- nrow(test)
+base_rate   <- mean(test$CARAVAN == pos_lab)
+
+TP_cut <- cm_cut$table["yes","yes"]; FP_cut <- cm_cut$table["yes","no"]; FN_cut <- cm_cut$table["no","yes"]
+TP_star <- cm_star$table["yes","yes"]; FP_star <- cm_star$table["yes","no"]; FN_star <- cm_star$table["no","yes"]
+
+# Metrics
+precision_cut  <- unname(cm_cut$byClass["Pos Pred Value"])
+recall_cut     <- unname(cm_cut$byClass["Sensitivity"])
+fpr_cut        <- unname(1 - cm_cut$byClass["Specificity"])
+precision_star <- unname(cm_star$byClass["Pos Pred Value"])
+recall_star    <- unname(cm_star$byClass["Sensitivity"])
+fpr_star       <- unname(1 - cm_star$byClass["Specificity"])
+
+# One combined table 
+combined_tbl <- tibble(
+  Parameter = c(
+    "Threshold", "Mailed", "Precision", "Recall (TPR)", "FPR", "AUC", "Profit",
+    "—",
+    "Mail rate", "Base rate", "Lift (Precision/Base)",
+    "TP (hits)", "FP (waste)", "FN (missed)",
+    "Profit per mailed", "Δ Profit vs Cut off"
+  ),
+  `Cut off` = c(
+    sprintf("%.6f", cutoff),
+    fmt_int(mailed_cut),
+    fmt_pct(precision_cut),
+    fmt_pct(recall_cut),
+    fmt_pct(fpr_cut),
+    sprintf("%.3f", as.numeric(auc_dt2)),
+    fmt_eur(profit_cut),
+    "",
+    fmt_pct(mailed_cut / n_test),
+    fmt_pct(base_rate),
+    sprintf("×%.2f", as.numeric(precision_cut) / as.numeric(base_rate)),
+    fmt_int(TP_cut), fmt_int(FP_cut), fmt_int(FN_cut),
+    fmt_eur(profit_cut / mailed_cut),
+    "—"
+  ),
+  `*` = c(
+    sprintf("%.6f", t_star),
+    fmt_int(mailed_star),
+    fmt_pct(precision_star),
+    fmt_pct(recall_star),
+    fmt_pct(fpr_star),
+    sprintf("%.3f", as.numeric(auc_dt2)),  # AUC is threshold-independent
+    fmt_eur(profit_star),
+    "",
+    fmt_pct(mailed_star / n_test),
+    fmt_pct(base_rate),
+    sprintf("×%.2f", as.numeric(precision_star) / as.numeric(base_rate)),
+    fmt_int(TP_star), fmt_int(FP_star), fmt_int(FN_star),
+    fmt_eur(profit_star / mailed_star),
+    fmt_eur(profit_star - profit_cut)
+  )
+)
+
+knitr::kable(combined_tbl, align = "lcc",
+             caption = "Cut off vs. Profit-Maximizing (*) — Full summary")
+
+```
+
+## Decision Threshold Summary
+
+-   **Business “Cut off” (0.0283)** — mails **everyone (100%)**
+    (recall=1, specificity=0)\
+    Precision **5.96%** (≈ base rate); **Profit €1,635.90**; **€0.94 per
+    mail**.\
+    **FN = 0**, but **FP waste = 1,642**.
+
+-   **Profit-max “\*” (0.4221)** — mails **921 people (52.75%)**.\
+    Precision **9.55%** (lift × **1.60**); Recall **84.62%** (**FN =
+    16**);\
+    **Profit €1,857.15** (**+13.5%** vs. cut off); **€2.02 per mail**
+    (**+115%**).
+
+-   **AUC = 0.721** for both → ranking quality is the same; the
+    **threshold choice** drives the difference.
+
+**Bottom line.** The business cutoff is too low for this (slightly
+over-optimistic) tree, so it effectively says “mail everyone.” The
+profit-max threshold cuts volume by \~47% while increasing total profit
+and ROI per mail. **Use the profit-max (or a top-N) rule** going
+forward.
+
+# Decision Tree, Logistic Regression & Naive Bayes
+
+Now, we will build logistic regression model, decision tree and naive
+bayes
+
+```{r DecTree_T3}
+profit_per_conv <- 30; cost_mail <- 0.85
+pos_lab <- "yes"
+
+ths <- sort(unique(c(0, quantile(p_dt2, probs = seq(0, 1, 0.01)))))
+profit_of <- function(t){
+  contact <- p_dt2 >= t
+  sum(ifelse(contact,
+             ifelse(test$CARAVAN == pos_lab, profit_per_conv - cost_mail, -cost_mail),
+             0))
+}
+
+profits <- sapply(ths, profit_of)
+t_star  <- ths[which.max(profits)]
+
+pred_star <- factor(ifelse(p_dt2 >= t_star, pos_lab, "no"),
+                    levels = levels(test$CARAVAN))
+cm_star <- caret::confusionMatrix(pred_star, test$CARAVAN, positive = pos_lab)
+
+list(threshold = t_star,
+     n_contacted = sum(p_dt2 >= t_star),
+     precision   = cm_star$byClass["Pos Pred Value"],
+     recall      = cm_star$byClass["Sensitivity"],
+     fpr         = 1 - cm_star$byClass["Specificity"],
+     profit      = max(profits))
+
+
+```
+
+We mail 921 people, catch \~85% of true buyers (high recall), but still
+contact \~49% of non-buyers (FPR ≈ 0.493).
+
+Precision ≈ 9.6% (vs base \~6%) good lift, but we can likely raise
+precision (and keep profit) by (a) optimizing for top-N and (b)
+calibrating tree probabilities (trees are famously over-confident).
+
+```{r Fit models}
+
+decTree_T3    <- partykit::ctree(fT3, data = training_set[, columns])
+logitModel_T3 <- glm(fT3, family = binomial("logit"), data = training_set[, columns])
+NBmodel_T3    <- naive_bayes(fT3, data = training_set[, columns])
+LDAmodel_T3   <- lda(fT3, data = training_set[, columns])
+
+```
+
+```{r xx}
+# Predict probabilities on test (needed for ROC)
+p_dt <- predict(decTree_T3, newdata = test_set, type = "prob")[, 2]   # P(CARAVAN=1)
+p_lr <- predict(logitModel_T3, newdata = test_set, type = "response") # P(CARAVAN=1)
+p_nb <- predict(NBmodel_T3,  newdata = test_set, type = "prob")[, 2]  # P(CARAVAN=1)
+
+# Actual labels
+actual <- test_set$CARAVAN
+
+# LDA probabilities for class "1" (fallback to 2nd column)
+lda_out <- predict(LDAmodel_T3, newdata = test_set)
+p_lda <- if (!is.null(colnames(lda_out$posterior)) && "1" %in% colnames(lda_out$posterior)) {
+  lda_out$posterior[, "1"]
+} else {
+  lda_out$posterior[, 2]
+}
+
+```
+
+```{r Plot ROC}
+roc_decTree_T3 <- plot.roc(actual, p_dt,
+  main = "ROC: decision tree (red), logistic reg (blue), NB (green), LDA (purple)",
+  col = "red")
+roc_logit_T3 <- lines.roc(actual, p_lr, col = "blue")
+roc_NB_T3    <- lines.roc(actual, p_nb, col = "green")
+lines.roc(actual, p_lda, col = "purple")
+
+```
+
+```{r Plot DTree}
+
+plot(decTree_T3)
+
+```
+
+THIS DECISION TREE IS NOT LOOKING GOOD
+
+```{r Confusion Matrix}
+
+# Choose positive label (uses "1" if present; otherwise last level)
+POS <- if ("1" %in% levels(test_set$CARAVAN)) "1" else tail(levels(test_set$CARAVAN), 1)
+NEG <- setdiff(levels(test_set$CARAVAN), POS)[1]
+
+to_class <- function(p) factor(ifelse(p >= 0.5, POS, NEG), levels = levels(test_set$CARAVAN))
+
+pred_dt_class  <- to_class(p_dt)
+pred_lr_class  <- to_class(p_lr)
+pred_nb_class  <- to_class(p_nb)
+pred_lda_class <- to_class(p_lda)
+
+cm_dt  <- confusionMatrix(pred_dt_class,  test_set$CARAVAN, positive = POS)
+cm_lr  <- confusionMatrix(pred_lr_class,  test_set$CARAVAN, positive = POS)
+cm_nb  <- confusionMatrix(pred_nb_class,  test_set$CARAVAN, positive = POS)
+cm_lda <- confusionMatrix(pred_lda_class, test_set$CARAVAN, positive = POS)
+
+
+
+```
+
+```{r Confusion Matrix Decision Tree}
+
+cm_dt
+
+
+```
+
+THOSE VALUES ARE NOT LOOKING GOOD -\> I HAVE TO ADJUST THE DECISION TREE
+MODEL
+
+```{r Confusion Matrix Logistic Regression}
+
+cm_lr
+
+
+```
+
+```{r Confusion Matrix Naive Bayes}
+
+cm_nb
+
+
+```
+
+```{r Confusion Matrix LDA}
+
+cm_lda
+
+
+```
+
+```{r Metrics}
+# Metrics: Decision Tree
+precision <- as.numeric(cm_dt$byClass["Pos Pred Value"])  # Precision
+recall    <- as.numeric(cm_dt$byClass["Sensitivity"])     # Recall / TPR
+fpr       <- 1 - as.numeric(cm_dt$byClass["Specificity"]) # FPR
+f1        <- 2 * precision * recall / (precision + recall)
+c(precision = precision, recall = recall, fpr = fpr, f1 = f1)
+
+```
+
+THERE IS SOMETHING WRONG
+
+```{r Metrics}
+# Metrics: Naive Bayes
+precision <- as.numeric(cm_nb$byClass["Pos Pred Value"])
+recall    <- as.numeric(cm_nb$byClass["Sensitivity"])
+fpr       <- 1 - as.numeric(cm_nb$byClass["Specificity"])
+f1        <- 2 * precision * recall / (precision + recall)
+c(precision = precision, recall = recall, fpr = fpr, f1 = f1)
+
+
+```
+
+```{r Metrics}
+# Metrics: LDA
+precision <- as.numeric(cm_lda$byClass["Pos Pred Value"])
+recall    <- as.numeric(cm_lda$byClass["Sensitivity"])
+fpr       <- 1 - as.numeric(cm_lda$byClass["Specificity"])
+f1        <- 2 * precision * recall / (precision + recall)
+c(precision = precision, recall = recall, fpr = fpr, f1 = f1)
+
+
+```
+
+SOMETHING WRONG
